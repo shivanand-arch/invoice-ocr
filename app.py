@@ -73,18 +73,17 @@ st.markdown("""
 ALLOWED_DOMAIN = "exotel.com"
 
 _user = st.user if hasattr(st, "user") else getattr(st, "experimental_user", None)
+_is_logged_in = getattr(_user, "is_logged_in", False) if _user else False
 user_email = (getattr(_user, "email", None) or "") if _user else ""
 
-if not user_email:
+if not _is_logged_in:
     st.markdown("### Please sign in with your Exotel Google account")
-    if st.button("Sign in with Google", type="primary"):
-        st.login("google")
+    st.login()
     st.stop()
 
 if not user_email.endswith(f"@{ALLOWED_DOMAIN}"):
     st.error(f"Access restricted to @{ALLOWED_DOMAIN} accounts. You are signed in as {user_email}.")
-    if st.button("Sign out"):
-        st.logout()
+    st.logout()
     st.stop()
 
 st.caption(f"Signed in as **{user_email}**")
