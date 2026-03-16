@@ -72,7 +72,8 @@ st.markdown("""
 # ─── Google OAuth (exotel.com only) ───
 ALLOWED_DOMAIN = "exotel.com"
 
-user_email = getattr(st.experimental_user, "email", None) or ""
+_user = st.user if hasattr(st, "user") else getattr(st, "experimental_user", None)
+user_email = (getattr(_user, "email", None) or "") if _user else ""
 
 if not user_email:
     st.markdown("### Please sign in with your Exotel Google account")
