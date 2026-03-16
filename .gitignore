@@ -1,0 +1,15 @@
+# Secrets - NEVER commit
+.streamlit/secrets.toml
+
+# Data files (local state)
+data/*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Sample invoices (large PDFs)
+sample_invoices/
