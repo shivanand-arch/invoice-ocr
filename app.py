@@ -10,6 +10,7 @@ import io
 import csv
 import zipfile
 import pandas as pd
+from pypdf import PdfReader, PdfWriter
 
 # ─── Page Config ───
 st.set_page_config(
@@ -26,6 +27,13 @@ VENDOR_MAPPINGS_FILE = DATA_DIR / "vendor_mappings.json"
 ACCOUNT_MAPPINGS_FILE = DATA_DIR / "account_mappings.json"
 PROCESSED_INVOICES_FILE = DATA_DIR / "processed_invoices.json"
 CREDIT_OVERRIDES_FILE = DATA_DIR / "credit_overrides.json"
+MASTER_SHEET_FILE = DATA_DIR / "master_sheet_mappings.json"
+
+# ─── Large PDF Handling Config ───
+# Invoice summary data is on the first/last few pages; CDR pages are skipped
+MAX_PAGES_FOR_CLAUDE = 80  # Max pages to send to Claude in one request
+FRONT_PAGES = 5            # First N pages to always include
+BACK_PAGES = 5             # Last N pages to always include
 
 # ─── CSS ───
 st.markdown("""
@@ -159,6 +167,14 @@ def save_credit_overrides(overrides):
     save_json(CREDIT_OVERRIDES_FILE, overrides)
 
 
+def get_master_mappings():
+    return load_json(MASTER_SHEET_FILE)
+
+
+def save_master_mappings(mappings):
+    save_json(MASTER_SHEET_FILE, mappings)
+
+
 # ─── Duplicate Check ───
 def check_duplicate(vendor_name, invoice_no, invoice_date, invoice_value):
     processed = get_processed_invoices()
@@ -176,11 +192,30 @@ STANDARD_CREDIT_DAYS = {
     "Veeno": 30,
     "Exotel": 45,
     "Drishti": 45,
-    "International": 20,
 }
 
 
-def calculate_due_date(invoice_date_str, entity, vendor_name=None, account_no=None):
+def calculate_due_date(invoice_date_str, entity, vendor_name=None, account_no=None, due_date_on_invoice=None):
+    """Calculate due date based on entity rules:
+    - Exotel: 45 days from invoice date
+    - Veeno: 30 days from invoice date
+    - International: use the due date printed on the invoice as-is
+    """
+    # For International entities, use the due date from the invoice directly
+    if entity and "international" in entity.lower():
+        if due_date_on_invoice and due_date_on_invoice.lower() not in ("", "pay immediate", "null", "none"):
+            # Try to parse and reformat to standard DD-Mon-YY
+            for fmt in ("%d-%b-%y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d-%b-%Y"):
+                try:
+                    parsed = datetime.strptime(due_date_on_invoice, fmt)
+                    return parsed.strftime("%d-%b-%y")
+                except (ValueError, TypeError):
+                    continue
+            # If no format matched, return the raw value
+            return due_date_on_invoice
+        # Fallback: if no due date on invoice, return empty
+        return ""
+
     try:
         inv_date = datetime.strptime(invoice_date_str, "%d-%b-%y")
     except (ValueError, TypeError):
@@ -271,28 +306,113 @@ def derive_product_short(full_product):
     return full_product.split()[0] if full_product else ""
 
 
+# ─── Master Sheet Parser ───
+def parse_master_sheet(df):
+    """Parse master sheet DataFrame: Column K (index 10) = Account No, Column H (index 7) = Product.
+    Returns dict mapping account_no -> {product, product_short}."""
+    mappings = {}
+    if len(df.columns) < 11:
+        return mappings
+
+    # Column H (index 7) = Product, Column K (index 10) = Account No
+    account_col = df.columns[10]  # Column K
+    product_col = df.columns[7]   # Column H
+
+    for _, row in df.iterrows():
+        acct = str(row[account_col]).strip()
+        product = str(row[product_col]).strip()
+        if not acct or acct in ("nan", "", "None"):
+            continue
+        if not product or product in ("nan", "", "None"):
+            continue
+
+        product_short = derive_product_short(product)
+        mappings[acct] = {
+            "product": product,
+            "product_short": product_short,
+        }
+
+    return mappings
+
+
+# ─── Large PDF Trimming ───
+def trim_pdf_for_extraction(pdf_bytes):
+    """For large PDFs (500+ pages), extract only the first and last few pages.
+    Invoice summary data (account, amounts, dates) is always on these pages.
+    The middle pages are typically CDR (Call Detail Records) which aren't needed.
+
+    Returns: (trimmed_pdf_bytes, total_page_count, was_trimmed)
+    """
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        total_pages = len(reader.pages)
+
+        if total_pages <= MAX_PAGES_FOR_CLAUDE:
+            return pdf_bytes, total_pages, False
+
+        # Extract first N and last N pages
+        writer = PdfWriter()
+        pages_to_include = set()
+
+        # First pages (invoice header, account details, billing summary)
+        for i in range(min(FRONT_PAGES, total_pages)):
+            pages_to_include.add(i)
+
+        # Last pages (totals, payment summary, due date)
+        for i in range(max(0, total_pages - BACK_PAGES), total_pages):
+            pages_to_include.add(i)
+
+        for page_idx in sorted(pages_to_include):
+            writer.add_page(reader.pages[page_idx])
+
+        output = io.BytesIO()
+        writer.write(output)
+        output.seek(0)
+        trimmed_bytes = output.read()
+
+        return trimmed_bytes, total_pages, True
+
+    except Exception:
+        # If PDF parsing fails, return original and let Claude try
+        return pdf_bytes, 0, False
+
+
 # ─── Claude Extraction ───
 def extract_invoice_data(pdf_bytes, filename):
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    # Trim large PDFs to avoid token limits
+    trimmed_bytes, total_pages, was_trimmed = trim_pdf_for_extraction(pdf_bytes)
+
+    if was_trimmed:
+        st.info(
+            f"📋 `{filename}`: {total_pages} pages detected — sending first {FRONT_PAGES} + last {BACK_PAGES} pages "
+            f"(skipping {total_pages - FRONT_PAGES - BACK_PAGES} CDR pages)"
+        )
+
+    pdf_b64 = base64.standard_b64encode(trimmed_bytes).decode("utf-8")
 
     vendor_mappings = get_vendor_mappings()
-    account_mappings = get_account_mappings()
 
+    # Keep mapping context minimal to save tokens — only vendor mappings
+    # Account→Product mapping is applied post-extraction from master sheet
     mapping_context = ""
     if vendor_mappings:
         mapping_context += "\n\nKnown vendor-to-entity mappings:\n"
-        for vendor, info in vendor_mappings.items():
+        for vendor, info in list(vendor_mappings.items())[:20]:
             mapping_context += f"- {vendor} → Entity: {info.get('entity', 'unknown')}\n"
-    if account_mappings:
-        mapping_context += "\nKnown account number mappings:\n"
-        for acct, info in account_mappings.items():
-            mapping_context += f"- Account {acct} → Product: {info.get('product_short', info.get('product', 'unknown'))}\n"
+
+    trimmed_note = ""
+    if was_trimmed:
+        trimmed_note = (
+            f"\n\nNOTE: This PDF originally has {total_pages} pages. Only the first {FRONT_PAGES} and last {BACK_PAGES} "
+            f"pages are provided (the middle pages contain CDR/call detail records). "
+            f"Extract all invoice summary data from these pages."
+        )
 
     extraction_prompt = f"""You are an expert invoice data extraction system for Exotel's Finance/AP team.
 Extract ALL the following fields from this Tata Teleservices invoice PDF. Be precise with numbers and dates.
-
-{mapping_context}
+{mapping_context}{trimmed_note}
 
 Return a JSON object with exactly these fields:
 {{
@@ -366,6 +486,8 @@ IMPORTANT:
         return None
 
     data["_source_file"] = filename
+    data["_total_pages"] = total_pages
+    data["_was_trimmed"] = was_trimmed
     return data
 
 
@@ -380,9 +502,17 @@ def invoice_to_tracker_row(sno, data):
     vendor_name = data.get("vendor_name", "")
     account_no = str(data.get("account_no", ""))
     invoice_no = str(data.get("invoice_no", ""))
+    due_date_on_invoice = data.get("due_date_on_invoice", "")
 
-    # Due date
-    due_date = calculate_due_date(inv_date, entity, vendor_name, account_no)
+    # Master sheet mapping: override product based on account number
+    master_mappings = get_master_mappings()
+    if account_no and account_no in master_mappings:
+        master_entry = master_mappings[account_no]
+        # Product from master sheet takes priority
+        product_short = master_entry.get("product_short", product_short)
+
+    # Due date: Exotel=45d, Veeno=30d, International=invoice due date
+    due_date = calculate_due_date(inv_date, entity, vendor_name, account_no, due_date_on_invoice)
 
     # Description
     desc = generate_description(product_short, circle, entity, inv_date, start_date, end_date)
@@ -504,13 +634,18 @@ if uploaded_files:
                     # Apply learned mappings
                     vendor_mappings = get_vendor_mappings()
                     account_mappings = get_account_mappings()
+                    master_mappings = get_master_mappings()
                     vendor_key = (data.get("vendor_name") or "").strip().lower()
                     acct_key = str(data.get("account_no") or "")
 
                     if vendor_key in vendor_mappings and not data.get("entity"):
                         data["entity"] = vendor_mappings[vendor_key].get("entity", "")
 
-                    if acct_key in account_mappings:
+                    # Master sheet mapping takes priority for product
+                    if acct_key in master_mappings:
+                        master_entry = master_mappings[acct_key]
+                        data["product_short"] = master_entry.get("product_short", data.get("product_short", ""))
+                    elif acct_key in account_mappings:
                         if not data.get("product_short"):
                             data["product_short"] = account_mappings[acct_key].get("product_short", "")
 
@@ -633,8 +768,47 @@ if st.session_state.tracker_df is not None:
 with st.sidebar:
     st.markdown("### Settings")
 
+    with st.expander("Master Sheet (Account → Product Mapping)"):
+        master = get_master_mappings()
+        st.metric("Mapped Accounts", len(master))
+
+        st.caption("Upload the master sheet (CSV or Excel) to map Account No (Col K) → Product (Col H)")
+        master_file = st.file_uploader(
+            "Upload master sheet",
+            type=["csv", "xlsx", "xls"],
+            key="master_upload",
+        )
+        if master_file:
+            try:
+                if master_file.name.lower().endswith(".csv"):
+                    master_df = pd.read_csv(master_file)
+                else:
+                    master_df = pd.read_excel(master_file)
+
+                new_mappings = parse_master_sheet(master_df)
+                if new_mappings:
+                    save_master_mappings(new_mappings)
+                    st.success(f"Loaded **{len(new_mappings)}** account-to-product mappings from master sheet.")
+                    st.rerun()
+                else:
+                    st.warning("No valid Account No → Product mappings found. Ensure Column K has Account No and Column H has Product.")
+            except Exception as e:
+                st.error(f"Error parsing master sheet: {e}")
+
+        if master:
+            st.markdown("**Account → Product mappings:**")
+            for acct, info in list(master.items())[:20]:
+                st.text(f"  {acct} → {info.get('product_short', info.get('product', '?'))}")
+            if len(master) > 20:
+                st.caption(f"... and {len(master) - 20} more")
+
+        if master and st.button("Clear Master Mappings"):
+            save_master_mappings({})
+            st.success("Master mappings cleared.")
+            st.rerun()
+
     with st.expander("Credit Period Overrides"):
-        st.caption("Standard: Veeno=30d, Exotel/Drishti=45d, International=20d")
+        st.caption("Standard: Veeno=30d, Exotel/Drishti=45d, International=invoice due date")
         overrides = get_credit_overrides()
         if "vendor" not in overrides:
             overrides["vendor"] = {}
