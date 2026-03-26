@@ -26,6 +26,11 @@ VENDOR_MAPPINGS_FILE = DATA_DIR / "vendor_mappings.json"
 ACCOUNT_MAPPINGS_FILE = DATA_DIR / "account_mappings.json"
 PROCESSED_INVOICES_FILE = DATA_DIR / "processed_invoices.json"
 CREDIT_OVERRIDES_FILE = DATA_DIR / "credit_overrides.json"
+MASTER_SHEET_FILE = DATA_DIR / "master_sheet_mappings.json"
+
+# Google Sheet URL for the master mapping sheet
+MASTER_SHEET_ID = "10z8bMJnYx4LhKDDNcJdqaU0Jic3I_pfzPgSG9sG7J7M"
+MASTER_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/export?format=csv&gid=0"
 
 # ─── CSS ───
 st.markdown("""
@@ -159,6 +164,53 @@ def save_credit_overrides(overrides):
     save_json(CREDIT_OVERRIDES_FILE, overrides)
 
 
+def get_master_mappings():
+    return load_json(MASTER_SHEET_FILE)
+
+
+def save_master_mappings(mappings):
+    save_json(MASTER_SHEET_FILE, mappings)
+
+
+def parse_master_sheet(df):
+    """Parse master sheet DataFrame: Column K (index 10) = Account No, Column H (index 7) = Product.
+    Returns dict mapping account_no -> {product, product_short, ...} with all row data."""
+    mappings = {}
+    if len(df.columns) < 11:
+        return mappings
+
+    # Column H (index 7) = Product, Column K (index 10) = Account No
+    account_col = df.columns[10]  # Column K
+    product_col = df.columns[7]   # Column H
+
+    for _, row in df.iterrows():
+        acct = str(row[account_col]).strip()
+        product = str(row[product_col]).strip()
+        if not acct or acct in ("nan", "", "None"):
+            continue
+        if not product or product in ("nan", "", "None"):
+            continue
+
+        product_short = derive_product_short(product)
+
+        # Collect other useful columns if available
+        entry = {
+            "product": product,
+            "product_short": product_short,
+        }
+
+        # Try to capture entity and circle from surrounding columns if they exist
+        # Store all column values for reference
+        for i, col in enumerate(df.columns):
+            val = str(row[col]).strip()
+            if val and val not in ("nan", "None"):
+                entry[f"col_{i}_{col}"] = val
+
+        mappings[acct] = entry
+
+    return mappings
+
+
 # ─── Duplicate Check ───
 def check_duplicate(vendor_name, invoice_no, invoice_date, invoice_value):
     processed = get_processed_invoices()
@@ -176,11 +228,30 @@ STANDARD_CREDIT_DAYS = {
     "Veeno": 30,
     "Exotel": 45,
     "Drishti": 45,
-    "International": 20,
 }
 
 
-def calculate_due_date(invoice_date_str, entity, vendor_name=None, account_no=None):
+def calculate_due_date(invoice_date_str, entity, vendor_name=None, account_no=None, due_date_on_invoice=None):
+    """Calculate due date based on entity rules:
+    - Exotel: 45 days from invoice date
+    - Veeno: 30 days from invoice date
+    - International: use the due date printed on the invoice as-is
+    """
+    # For International entities, use the due date from the invoice directly
+    if entity and "international" in entity.lower():
+        if due_date_on_invoice and due_date_on_invoice.lower() not in ("", "pay immediate", "null", "none"):
+            # Try to parse and reformat to standard DD-Mon-YY
+            for fmt in ("%d-%b-%y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d-%b-%Y"):
+                try:
+                    parsed = datetime.strptime(due_date_on_invoice, fmt)
+                    return parsed.strftime("%d-%b-%y")
+                except (ValueError, TypeError):
+                    continue
+            # If no format matched, return the raw value
+            return due_date_on_invoice
+        # Fallback: if no due date on invoice, return empty
+        return ""
+
     try:
         inv_date = datetime.strptime(invoice_date_str, "%d-%b-%y")
     except (ValueError, TypeError):
@@ -278,13 +349,18 @@ def extract_invoice_data(pdf_bytes, filename):
 
     vendor_mappings = get_vendor_mappings()
     account_mappings = get_account_mappings()
+    master_mappings = get_master_mappings()
 
     mapping_context = ""
     if vendor_mappings:
         mapping_context += "\n\nKnown vendor-to-entity mappings:\n"
         for vendor, info in vendor_mappings.items():
             mapping_context += f"- {vendor} → Entity: {info.get('entity', 'unknown')}\n"
-    if account_mappings:
+    if master_mappings:
+        mapping_context += "\nMaster sheet account-to-product mappings:\n"
+        for acct, info in list(master_mappings.items())[:50]:
+            mapping_context += f"- Account {acct} → Product: {info.get('product_short', info.get('product', 'unknown'))}\n"
+    elif account_mappings:
         mapping_context += "\nKnown account number mappings:\n"
         for acct, info in account_mappings.items():
             mapping_context += f"- Account {acct} → Product: {info.get('product_short', info.get('product', 'unknown'))}\n"
@@ -380,9 +456,17 @@ def invoice_to_tracker_row(sno, data):
     vendor_name = data.get("vendor_name", "")
     account_no = str(data.get("account_no", ""))
     invoice_no = str(data.get("invoice_no", ""))
+    due_date_on_invoice = data.get("due_date_on_invoice", "")
 
-    # Due date
-    due_date = calculate_due_date(inv_date, entity, vendor_name, account_no)
+    # Master sheet mapping: override product based on account number
+    master_mappings = get_master_mappings()
+    if account_no and account_no in master_mappings:
+        master_entry = master_mappings[account_no]
+        # Product from master sheet takes priority
+        product_short = master_entry.get("product_short", product_short)
+
+    # Due date: Exotel=45d, Veeno=30d, International=invoice due date
+    due_date = calculate_due_date(inv_date, entity, vendor_name, account_no, due_date_on_invoice)
 
     # Description
     desc = generate_description(product_short, circle, entity, inv_date, start_date, end_date)
@@ -504,13 +588,18 @@ if uploaded_files:
                     # Apply learned mappings
                     vendor_mappings = get_vendor_mappings()
                     account_mappings = get_account_mappings()
+                    master_mappings = get_master_mappings()
                     vendor_key = (data.get("vendor_name") or "").strip().lower()
                     acct_key = str(data.get("account_no") or "")
 
                     if vendor_key in vendor_mappings and not data.get("entity"):
                         data["entity"] = vendor_mappings[vendor_key].get("entity", "")
 
-                    if acct_key in account_mappings:
+                    # Master sheet mapping takes priority for product
+                    if acct_key in master_mappings:
+                        master_entry = master_mappings[acct_key]
+                        data["product_short"] = master_entry.get("product_short", data.get("product_short", ""))
+                    elif acct_key in account_mappings:
                         if not data.get("product_short"):
                             data["product_short"] = account_mappings[acct_key].get("product_short", "")
 
@@ -633,8 +722,47 @@ if st.session_state.tracker_df is not None:
 with st.sidebar:
     st.markdown("### Settings")
 
+    with st.expander("Master Sheet (Account → Product Mapping)"):
+        master = get_master_mappings()
+        st.metric("Mapped Accounts", len(master))
+
+        st.caption("Upload the master sheet (CSV or Excel) to map Account No (Col K) → Product (Col H)")
+        master_file = st.file_uploader(
+            "Upload master sheet",
+            type=["csv", "xlsx", "xls"],
+            key="master_upload",
+        )
+        if master_file:
+            try:
+                if master_file.name.lower().endswith(".csv"):
+                    master_df = pd.read_csv(master_file)
+                else:
+                    master_df = pd.read_excel(master_file)
+
+                new_mappings = parse_master_sheet(master_df)
+                if new_mappings:
+                    save_master_mappings(new_mappings)
+                    st.success(f"Loaded **{len(new_mappings)}** account-to-product mappings from master sheet.")
+                    st.rerun()
+                else:
+                    st.warning("No valid Account No → Product mappings found. Ensure Column K has Account No and Column H has Product.")
+            except Exception as e:
+                st.error(f"Error parsing master sheet: {e}")
+
+        if master:
+            st.markdown("**Account → Product mappings:**")
+            for acct, info in list(master.items())[:20]:
+                st.text(f"  {acct} → {info.get('product_short', info.get('product', '?'))}")
+            if len(master) > 20:
+                st.caption(f"... and {len(master) - 20} more")
+
+        if master and st.button("Clear Master Mappings"):
+            save_master_mappings({})
+            st.success("Master mappings cleared.")
+            st.rerun()
+
     with st.expander("Credit Period Overrides"):
-        st.caption("Standard: Veeno=30d, Exotel/Drishti=45d, International=20d")
+        st.caption("Standard: Veeno=30d, Exotel/Drishti=45d, International=invoice due date")
         overrides = get_credit_overrides()
         if "vendor" not in overrides:
             overrides["vendor"] = {}
