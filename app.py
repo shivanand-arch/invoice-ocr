@@ -31,8 +31,8 @@ MASTER_SHEET_FILE = DATA_DIR / "master_sheet_mappings.json"
 
 # ─── Large PDF Handling Config ───
 # Invoice summary data is on the first/last few pages; CDR pages are skipped
-MAX_PAGES_FOR_CLAUDE = 80  # Max pages to send to Claude in one request
-FRONT_PAGES = 5            # First N pages to always include
+MAX_PAGES_FOR_CLAUDE = 25  # Max pages to send to Claude in one request
+FRONT_PAGES = 10           # First N pages to always include
 BACK_PAGES = 5             # Last N pages to always include
 
 # ─── CSS ───
@@ -416,32 +416,37 @@ Extract ALL the following fields from this Tata Teleservices invoice PDF. Be pre
 
 Return a JSON object with exactly these fields:
 {{
-  "entity": "<EXOTEL TECHCOM PRIVATE LIMITED → Exotel, VEENO COMMUNICATIONS PRIVATE LIMITED → Veeno, DRISHTI-SOFT SOLUTIONS PRIVATE LIMITED → Drishti. This is the CUSTOMER name on the invoice.>",
-  "vendor_name": "<The service provider / biller name in UPPERCASE, e.g. TATA TELESERVICES (MAHARASHTRA) LTD or TATA TELESERVICES LIMITED>",
+  "entity": "<EXOTEL TECHCOM PRIVATE LIMITED → Exotel, VEENO COMMUNICATIONS PRIVATE LIMITED → Veeno, DRISHTI-SOFT SOLUTIONS PRIVATE LIMITED → Drishti, EXOTEL TECHCOM PTE LTD → Exotel International. This is the CUSTOMER name on the invoice.>",
+  "vendor_name": "<The service provider / biller name in UPPERCASE, e.g. TATA TELESERVICES (MAHARASHTRA) LTD or TATA TELESERVICES LIMITED or BHARTI AIRTEL LIMITED or DU (EMIRATES INTEGRATED TELECOMMUNICATIONS)>",
   "customer_gstin": "<Customer's GST number>",
   "account_no": "<Account No from Bill Details>",
   "invoice_no": "<Bill/Invoice No>",
   "invoice_date": "<Bill Date in DD-Mon-YY format, e.g. 03-Mar-26>",
-  "bill_period_start": "<Start of Bill Period in DD-Mon-YY>",
-  "bill_period_end": "<End of Bill Period in DD-Mon-YY>",
+  "header_bill_period": "<The billing period shown in the header/top section of the invoice, in DD-Mon-YY to DD-Mon-YY format>",
+  "bill_period_start": "<Actual Start of Bill Period from the charges summary/detail section in DD-Mon-YY>",
+  "bill_period_end": "<Actual End of Bill Period from the charges summary/detail section in DD-Mon-YY>",
+  "period_mismatch": <true/false — set to true if the header billing period differs from the actual charges billing period>,
+  "period_mismatch_detail": "<Describe the mismatch if any, e.g. 'Header says 01-Jan-26 to 31-Jan-26 but charges are for 15-Dec-25 to 14-Jan-26'. null if no mismatch>",
   "due_date_on_invoice": "<Due Date as printed on the invoice, or 'Pay Immediate' if so stated>",
-  "currency": "INR",
+  "currency": "<INR, AED, USD, etc.>",
   "rental_charges": <number>,
   "usage_charges": <number>,
   "subtotal_without_tax": <number>,
   "one_time_charges": <number>,
-  "gst_amount": <number>,
+  "gst_amount": <number, 0 for international invoices with no GST/VAT>,
   "total_current_charges": <number, Total Current Charges including tax>,
-  "previous_balance": <number, Previous Balance amount, can be negative>,
-  "last_payment": <number>,
-  "invoice_value": <number, the Amount due before due date or Total Current Charges>,
-  "invoice_value_without_tax": <number, net value before GST>,
+  "previous_balance": <number, Previous Outstanding/Balance amount from the invoice. IMPORTANT: Look carefully — if the invoice shows 'Previous Balance' or 'Previous Outstanding' with a value, report it. If there is also a 'Payment Received/Adjusted' line, report that separately in last_payment. If no previous balance line exists, use 0.>,
+  "last_payment": <number, Payment received/adjusted amount, if shown on the invoice>,
+  "amount_due": <number, the final Amount Due / Amount Payable shown on the invoice>,
+  "invoice_value": <number, Total Current Charges (this period's charges including tax, EXCLUDING previous balance)>,
+  "invoice_value_without_tax": <number, net value before GST/tax>,
   "product": "<Full service/product name, e.g. SIP Trunk Channel Line Int>",
   "product_short": "<SHORT abbreviation: SIP, PRI, ILL, MPLS, TF, DID, Cloud, Broadband, VPNOL>",
   "circuit_ids": "<comma-separated Tata Tele Numbers / Circuit IDs>",
-  "circle": "<State from Installation/Place of Supply: Maharashtra, Rajasthan, Gujarat, Karnataka, etc.>",
+  "circle": "<State/Region from Installation/Place of Supply: Maharashtra, Rajasthan, Gujarat, Karnataka, Dubai, etc.>",
   "invoice_category": "<Recurring or One-time>",
-  "notes": "<any additional relevant information>"
+  "is_international": <true/false — true if the invoice is from an international vendor or has no GST>,
+  "notes": "<any additional relevant information, warnings, or anomalies detected>"
 }}
 
 IMPORTANT:
@@ -450,6 +455,9 @@ IMPORTANT:
 - The entity is the CUSTOMER (who is being billed), NOT the vendor.
 - For 'product_short', use: SIP for SIP Trunk, PRI for PRI/ISDN, ILL for Internet Leased Line, etc.
 - For 'circle', derive from the state in Installation/Place of Supply.
+- PERIOD CHECK: Carefully compare the billing period in the invoice header/top section with the actual period in the charges/summary section. Flag any mismatch.
+- PREVIOUS BALANCE: Report the exact 'Previous Balance/Outstanding' figure from the invoice. If the invoice shows payment adjustments, report them in last_payment separately. If there is NO previous balance line on the invoice, use 0 — do NOT invent one.
+- INTERNATIONAL INVOICES: For invoices with no GST (international vendors like DU, Etisalat, etc.), gst_amount should be 0 and invoice_value_without_tax should equal total_current_charges.
 - Return ONLY the JSON object, no other text."""
 
     response = client.messages.create(
@@ -518,9 +526,15 @@ def invoice_to_tracker_row(sno, data):
     desc = generate_description(product_short, circle, entity, inv_date, start_date, end_date)
 
     # Values
-    inv_value = data.get("total_current_charges") or data.get("invoice_value") or 0
-    gst_bc = data.get("invoice_value_without_tax") or data.get("subtotal_without_tax") or 0
+    is_international = data.get("is_international", False)
+    inv_value = data.get("invoice_value") or data.get("total_current_charges") or 0
     prev_bal = data.get("previous_balance") or 0
+
+    # GST/BC: For international invoices, GST = Invoice Value (no tax applied)
+    if is_international:
+        gst_bc = inv_value
+    else:
+        gst_bc = data.get("invoice_value_without_tax") or data.get("subtotal_without_tax") or 0
 
     # Received date = today
     received_dt = datetime.now().strftime("%d-%b-%y")
@@ -534,6 +548,22 @@ def invoice_to_tracker_row(sno, data):
     cogs = "Cogs"
     if account_no in account_mappings:
         cogs = account_mappings[account_no].get("cogs", "Cogs")
+
+    # Period mismatch warning
+    remarks_parts = []
+    if data.get("period_mismatch"):
+        mismatch_detail = data.get("period_mismatch_detail", "Header vs actual billing period mismatch")
+        remarks_parts.append(f"PERIOD MISMATCH: {mismatch_detail}")
+
+    # Previous balance anomaly: flag if previous_balance is reported but seems wrong
+    if prev_bal and float(prev_bal) != 0:
+        last_payment = data.get("last_payment") or 0
+        if float(last_payment) != 0:
+            remarks_parts.append(f"Prev bal: {fmt_currency(prev_bal)}, Payment adjusted: {fmt_currency(last_payment)}")
+
+    extra_notes = data.get("notes", "") or ""
+    if extra_notes:
+        remarks_parts.append(extra_notes)
 
     row = {}
     for col in TRACKER_COLUMNS:
@@ -558,9 +588,9 @@ def invoice_to_tracker_row(sno, data):
     row["Invoice Value"] = fmt_currency(inv_value)
     row["GST/BC"] = fmt_currency(gst_bc)
     row["Previous Balance"] = fmt_currency(prev_bal) if prev_bal else ""
-    row["Remarks"] = data.get("notes", "") or ""
-    row["Exotel"] = fmt_currency(inv_value) if entity == "Exotel" else ""
-    row["Veeno"] = fmt_currency(inv_value) if entity == "Veeno" else ""
+    row["Remarks"] = " | ".join(remarks_parts) if remarks_parts else ""
+    row["Exotel"] = fmt_currency(inv_value) if "exotel" in entity.lower() else ""
+    row["Veeno"] = fmt_currency(inv_value) if "veeno" in entity.lower() else ""
 
     return row
 
@@ -677,6 +707,13 @@ if st.session_state.tracker_df is not None:
     dup_count = (st.session_state.tracker_df["Repeat Number"] == "DUP").sum()
     if dup_count > 0:
         st.warning(f"{dup_count} duplicate invoice(s) detected (marked as DUP in Repeat Number column).")
+
+    # Check for period mismatches
+    mismatch_rows = st.session_state.tracker_df[
+        st.session_state.tracker_df["Remarks"].str.contains("PERIOD MISMATCH", case=False, na=False)
+    ]
+    if len(mismatch_rows) > 0:
+        st.warning(f"{len(mismatch_rows)} invoice(s) have billing period mismatches (header vs actual). Check Remarks column.")
 
     # Editable data editor
     edited_df = st.data_editor(
