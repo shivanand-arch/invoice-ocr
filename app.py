@@ -11,6 +11,9 @@ import csv
 import zipfile
 import pandas as pd
 from pypdf import PdfReader, PdfWriter
+import gspread
+from google.oauth2.credentials import Credentials as UserCredentials
+from google_auth_oauthlib.flow import Flow
 
 # ─── Page Config ───
 st.set_page_config(
@@ -99,6 +102,8 @@ if st.sidebar.button("Sign out"):
     st.logout()
 
 # ─── Tracker Column Definitions ───
+# (OAuth callback handler is defined later; called once UI is ready below.)
+
 TRACKER_COLUMNS = [
     "SNO", "Date", "PI NO", "Tracker No", "Cmp", "Cogs/Noncogs", "Vendor no.",
     "Product", "Circle", "Description", "Account No", "InvoiceNo", "Repeat Number",
@@ -173,6 +178,160 @@ def get_master_mappings():
 
 def save_master_mappings(mappings):
     save_json(MASTER_SHEET_FILE, mappings)
+
+
+# ─── Google Sheets Integration (per-user OAuth) ───
+# Each Biz Ops user authorizes once per session; rows are written to the sheet
+# using their own Google account (which already has access to the sheet).
+GSHEET_OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
+
+
+def _get_oauth_flow():
+    """Build the google-auth-oauthlib Flow object from secrets."""
+    client_id = st.secrets.get("GSHEET_OAUTH_CLIENT_ID", "")
+    client_secret = st.secrets.get("GSHEET_OAUTH_CLIENT_SECRET", "")
+    redirect_uri = st.secrets.get("GSHEET_OAUTH_REDIRECT_URI", "http://localhost:8501/")
+
+    if not client_id or not client_secret:
+        return None
+
+    client_config = {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [redirect_uri],
+        }
+    }
+    flow = Flow.from_client_config(client_config, scopes=GSHEET_OAUTH_SCOPES)
+    flow.redirect_uri = redirect_uri
+    return flow
+
+
+def handle_oauth_callback():
+    """If we returned from Google OAuth with ?code=..., exchange for a token
+    and store it in session_state. Called once per page load."""
+    if st.session_state.get("gsheet_credentials"):
+        return  # already have token
+
+    code = st.query_params.get("code")
+    if not code:
+        return
+
+    flow = _get_oauth_flow()
+    if not flow:
+        return
+
+    try:
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        st.session_state.gsheet_credentials = {
+            "token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes": creds.scopes,
+        }
+        # Clear ?code= from URL to avoid re-running on refresh
+        st.query_params.clear()
+    except Exception as e:
+        st.error(f"OAuth callback failed: {e}")
+
+
+def get_oauth_url():
+    """Build the Google OAuth consent URL the user should be sent to."""
+    flow = _get_oauth_flow()
+    if not flow:
+        return None
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    return auth_url
+
+
+def push_rows_to_tracker(tracker_df):
+    """Append tracker rows to the BC Tracker Google Sheet using the
+    signed-in Biz Ops user's OAuth token.
+    Returns (success_count, error_message)."""
+    creds_dict = st.session_state.get("gsheet_credentials")
+    if not creds_dict:
+        return 0, "Not authorized for Sheets access. Click 'Authorize Sheets Access' first."
+
+    spreadsheet_id = st.secrets.get("GSHEET_SPREADSHEET_ID", "")
+    if not spreadsheet_id:
+        return 0, "GSHEET_SPREADSHEET_ID not configured in secrets.toml."
+
+    worksheet_name = st.secrets.get("GSHEET_WORKSHEET_NAME", "BC Tracker")
+    worksheet_gid = st.secrets.get("GSHEET_WORKSHEET_GID", None)
+
+    creds = UserCredentials(**creds_dict)
+    try:
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(spreadsheet_id)
+    except Exception as e:
+        return 0, f"Cannot open sheet: {type(e).__name__}: {str(e)[:200]}"
+
+    # Find worksheet by name, falling back to gid, then first tab
+    try:
+        ws = spreadsheet.worksheet(worksheet_name)
+    except gspread.WorksheetNotFound:
+        if worksheet_gid is not None:
+            try:
+                ws = spreadsheet.get_worksheet_by_id(int(worksheet_gid))
+            except Exception:
+                ws = spreadsheet.get_worksheet(0)
+        else:
+            ws = spreadsheet.get_worksheet(0)
+
+    # Read sheet headers to map columns by name
+    sheet_headers = ws.row_values(1)
+    if not sheet_headers:
+        return 0, "BC Tracker sheet has no header row. Add headers matching the tracker columns."
+
+    # Build rows in sheet column order
+    rows_to_append = []
+    for _, row in tracker_df.iterrows():
+        sheet_row = []
+        for header in sheet_headers:
+            value = ""
+            if header in row.index:
+                value = "" if pd.isna(row[header]) else str(row[header])
+            sheet_row.append(value)
+        rows_to_append.append(sheet_row)
+
+    if not rows_to_append:
+        return 0, "No rows to push."
+
+    # Convert column count to A1-style column letter (handles AA, AB, …)
+    def col_letter(n):
+        result = ""
+        while n > 0:
+            n -= 1
+            result = chr(65 + n % 26) + result
+            n //= 26
+        return result
+
+    end_col = col_letter(len(sheet_headers))
+    next_row = len(ws.get_all_values()) + 1
+
+    try:
+        ws.update(
+            f"A{next_row}:{end_col}{next_row + len(rows_to_append) - 1}",
+            rows_to_append,
+            value_input_option="USER_ENTERED",
+        )
+    except gspread.exceptions.APIError as e:
+        return 0, f"Sheets API error: {str(e)[:200]}"
+
+    return len(rows_to_append), None
 
 
 # ─── Duplicate Check ───
@@ -601,6 +760,9 @@ if "tracker_df" not in st.session_state:
 if "raw_extractions" not in st.session_state:
     st.session_state.raw_extractions = []
 
+# Handle Google OAuth callback (?code=... in URL after consent screen)
+handle_oauth_callback()
+
 # ─── STEP 1: Upload ───
 st.markdown("### Upload Invoices")
 st.caption("Upload invoice PDFs or a ZIP file. Data will be extracted and shown as an editable tracker sheet.")
@@ -731,7 +893,7 @@ if st.session_state.tracker_df is not None:
 
     # Export buttons
     st.divider()
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         # CSV Export — full tracker format
@@ -766,6 +928,33 @@ if st.session_state.tracker_df is not None:
         )
 
     with col3:
+        is_authorized = bool(st.session_state.get("gsheet_credentials"))
+        if not is_authorized:
+            auth_url = get_oauth_url()
+            if auth_url:
+                st.link_button(
+                    "Authorize Sheets Access",
+                    auth_url,
+                    use_container_width=True,
+                    help="One-time per session: grants this app permission to write to Google Sheets as you.",
+                )
+            else:
+                st.button(
+                    "Push to BC Tracker",
+                    disabled=True,
+                    use_container_width=True,
+                    help="OAuth client not configured in secrets.toml.",
+                )
+        else:
+            if st.button("Push to BC Tracker", type="primary", use_container_width=True):
+                with st.spinner("Pushing to Google Sheet..."):
+                    count, error = push_rows_to_tracker(st.session_state.tracker_df)
+                    if error:
+                        st.error(f"Failed: {error}")
+                    else:
+                        st.success(f"Pushed **{count}** row(s) to BC Tracker sheet!")
+
+    with col4:
         if st.button("Save to History", use_container_width=True):
             # Save raw extractions and learn mappings
             processed = get_processed_invoices()
