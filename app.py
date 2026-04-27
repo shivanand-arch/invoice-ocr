@@ -207,6 +207,36 @@ GSHEET_OAUTH_SCOPES = [
 ]
 
 
+_SHEET_URL_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]+)")
+_SHEET_GID_RE = re.compile(r"[?#&]gid=(\d+)")
+_SHEET_RAW_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{20,}$")
+
+
+def parse_sheet_url(value: str):
+    """Parse a Google Sheets URL or raw ID into (spreadsheet_id, gid_or_None).
+
+    Accepts:
+      - https://docs.google.com/spreadsheets/d/<ID>/edit?gid=<GID>#gid=<GID>
+      - https://docs.google.com/spreadsheets/d/<ID>/edit#gid=<GID>
+      - https://docs.google.com/spreadsheets/d/<ID>/
+      - <ID>   (raw, no URL)
+
+    Returns ("", None) if the input doesn't look like either.
+    """
+    if not value:
+        return "", None
+    s = str(value).strip()
+    m = _SHEET_URL_RE.search(s)
+    if m:
+        sid = m.group(1)
+        g = _SHEET_GID_RE.search(s)
+        gid = int(g.group(1)) if g else None
+        return sid, gid
+    if _SHEET_RAW_ID_RE.match(s):
+        return s, None
+    return "", None
+
+
 def _get_oauth_flow():
     """Build the google-auth-oauthlib Flow object from secrets.
 
@@ -301,12 +331,16 @@ def push_rows_to_tracker(tracker_df):
     if not creds_dict:
         return 0, "Not authorized for Sheets access. Click 'Authorize Sheets Access' first."
 
-    spreadsheet_id = st.secrets.get("GSHEET_SPREADSHEET_ID", "")
+    # User's selected sheet (from the top-of-page input) wins; fall back to
+    # secrets defaults so existing deployments keep working unchanged.
+    spreadsheet_id = st.session_state.get("sheet_id") or st.secrets.get("GSHEET_SPREADSHEET_ID", "")
     if not spreadsheet_id:
-        return 0, "GSHEET_SPREADSHEET_ID not configured in secrets.toml."
+        return 0, "Paste a Google Sheets URL in the panel at the top first."
 
+    worksheet_gid = st.session_state.get("sheet_gid")
+    if worksheet_gid is None:
+        worksheet_gid = st.secrets.get("GSHEET_WORKSHEET_GID", None)
     worksheet_name = st.secrets.get("GSHEET_WORKSHEET_NAME", "BC Tracker")
-    worksheet_gid = st.secrets.get("GSHEET_WORKSHEET_GID", None)
 
     creds = UserCredentials(**creds_dict)
     try:
@@ -315,16 +349,18 @@ def push_rows_to_tracker(tracker_df):
     except Exception as e:
         return 0, f"Cannot open sheet: {type(e).__name__}: {str(e)[:200]}"
 
-    # Find worksheet by name, falling back to gid, then first tab
-    try:
-        ws = spreadsheet.worksheet(worksheet_name)
-    except gspread.WorksheetNotFound:
-        if worksheet_gid is not None:
-            try:
-                ws = spreadsheet.get_worksheet_by_id(int(worksheet_gid))
-            except Exception:
-                ws = spreadsheet.get_worksheet(0)
-        else:
+    # If the user pasted a URL with a gid, that's an explicit tab selection —
+    # honour it. Otherwise try worksheet_name from secrets, then first tab.
+    ws = None
+    if worksheet_gid is not None:
+        try:
+            ws = spreadsheet.get_worksheet_by_id(int(worksheet_gid))
+        except Exception:
+            ws = None
+    if ws is None:
+        try:
+            ws = spreadsheet.worksheet(worksheet_name)
+        except gspread.WorksheetNotFound:
             ws = spreadsheet.get_worksheet(0)
 
     # Read sheet headers to map columns by name
@@ -799,28 +835,45 @@ if "raw_extractions" not in st.session_state:
 # Handle Google OAuth callback (?code=... in URL after consent screen)
 handle_oauth_callback()
 
-# ─── BC Tracker connection panel (always visible at top) ───
-_sheet_id = st.secrets.get("GSHEET_SPREADSHEET_ID", "")
-_sheet_gid = st.secrets.get("GSHEET_WORKSHEET_GID", 0)
-_sheet_tab = st.secrets.get("GSHEET_WORKSHEET_NAME", "BC Tracker")
-_sheet_url = (
-    f"https://docs.google.com/spreadsheets/d/{_sheet_id}/edit?gid={_sheet_gid}"
-    if _sheet_id else ""
-)
+# ─── Google Sheet connection panel (always visible at top) ───
+# Prefill with the secrets default the first time, but let the user paste any
+# Google Sheets URL — push_rows_to_tracker uses session_state.sheet_id/gid.
+if "sheet_url_input" not in st.session_state:
+    _default_id = st.secrets.get("GSHEET_SPREADSHEET_ID", "")
+    _default_gid = st.secrets.get("GSHEET_WORKSHEET_GID", 0)
+    st.session_state.sheet_url_input = (
+        f"https://docs.google.com/spreadsheets/d/{_default_id}/edit?gid={_default_gid}"
+        if _default_id else ""
+    )
 
 with st.container(border=True):
-    col_link, col_auth = st.columns([3, 2])
-    with col_link:
-        if _sheet_url:
-            st.markdown(
-                f"**📊 Target Sheet:** [{_sheet_tab} → open in Google Sheets ↗]({_sheet_url})"
+    col_url, col_auth = st.columns([3, 2])
+    with col_url:
+        sheet_url_value = st.text_input(
+            "📊 Target Google Sheet URL",
+            key="sheet_url_input",
+            placeholder="https://docs.google.com/spreadsheets/d/.../edit?gid=...",
+            help="Paste any Google Sheets URL you want to push extracted invoice rows into. Make sure your account has edit access to this sheet.",
+        )
+
+        _sheet_id, _sheet_gid = parse_sheet_url(sheet_url_value)
+        st.session_state.sheet_id = _sheet_id
+        st.session_state.sheet_gid = _sheet_gid
+
+        if _sheet_id:
+            _open_url = (
+                f"https://docs.google.com/spreadsheets/d/{_sheet_id}/edit"
+                + (f"?gid={_sheet_gid}" if _sheet_gid is not None else "")
             )
-        else:
-            st.warning("No GSHEET_SPREADSHEET_ID configured in secrets.")
+            _gid_label = f" (tab gid {_sheet_gid})" if _sheet_gid is not None else " (first tab)"
+            st.caption(f"✓ Recognised sheet{_gid_label} — [open ↗]({_open_url})")
+        elif sheet_url_value:
+            st.caption("⚠️ Could not parse a sheet ID from that input.")
+
     with col_auth:
         _is_authorized = bool(st.session_state.get("gsheet_credentials"))
         if _is_authorized:
-            st.success("✅ Connected — ready to push to sheet", icon="🔓")
+            st.success("✅ Connected — ready to push", icon="🔓")
         else:
             _auth_url = get_oauth_url()
             if _auth_url:
