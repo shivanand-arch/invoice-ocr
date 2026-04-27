@@ -799,6 +799,40 @@ if "raw_extractions" not in st.session_state:
 # Handle Google OAuth callback (?code=... in URL after consent screen)
 handle_oauth_callback()
 
+# ─── BC Tracker connection panel (always visible at top) ───
+_sheet_id = st.secrets.get("GSHEET_SPREADSHEET_ID", "")
+_sheet_gid = st.secrets.get("GSHEET_WORKSHEET_GID", 0)
+_sheet_tab = st.secrets.get("GSHEET_WORKSHEET_NAME", "BC Tracker")
+_sheet_url = (
+    f"https://docs.google.com/spreadsheets/d/{_sheet_id}/edit?gid={_sheet_gid}"
+    if _sheet_id else ""
+)
+
+with st.container(border=True):
+    col_link, col_auth = st.columns([3, 2])
+    with col_link:
+        if _sheet_url:
+            st.markdown(
+                f"**📊 Target Sheet:** [{_sheet_tab} → open in Google Sheets ↗]({_sheet_url})"
+            )
+        else:
+            st.warning("No GSHEET_SPREADSHEET_ID configured in secrets.")
+    with col_auth:
+        _is_authorized = bool(st.session_state.get("gsheet_credentials"))
+        if _is_authorized:
+            st.success("✅ Connected — ready to push to sheet", icon="🔓")
+        else:
+            _auth_url = get_oauth_url()
+            if _auth_url:
+                st.link_button(
+                    "🔐 Authorize Sheets Access",
+                    _auth_url,
+                    use_container_width=True,
+                    help="One-time per session. You can do this while invoices upload — they happen in parallel.",
+                )
+            else:
+                st.error("OAuth client not configured in secrets.")
+
 # ─── STEP 1: Upload ───
 st.markdown("### Upload Invoices")
 st.caption("Upload invoice PDFs or a ZIP file. Data will be extracted and shown as an editable tracker sheet.")
@@ -965,23 +999,7 @@ if st.session_state.tracker_df is not None:
 
     with col3:
         is_authorized = bool(st.session_state.get("gsheet_credentials"))
-        if not is_authorized:
-            auth_url = get_oauth_url()
-            if auth_url:
-                st.link_button(
-                    "Authorize Sheets Access",
-                    auth_url,
-                    use_container_width=True,
-                    help="One-time per session: grants this app permission to write to Google Sheets as you.",
-                )
-            else:
-                st.button(
-                    "Push to BC Tracker",
-                    disabled=True,
-                    use_container_width=True,
-                    help="OAuth client not configured in secrets.toml.",
-                )
-        else:
+        if is_authorized:
             if st.button("Push to BC Tracker", type="primary", use_container_width=True):
                 with st.spinner("Pushing to Google Sheet..."):
                     count, error = push_rows_to_tracker(st.session_state.tracker_df)
@@ -989,6 +1007,13 @@ if st.session_state.tracker_df is not None:
                         st.error(f"Failed: {error}")
                     else:
                         st.success(f"Pushed **{count}** row(s) to BC Tracker sheet!")
+        else:
+            st.button(
+                "Push to BC Tracker",
+                disabled=True,
+                use_container_width=True,
+                help="Authorize Sheets access in the panel at the top of the page first.",
+            )
 
     with col4:
         if st.button("Save to History", use_container_width=True):
