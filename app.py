@@ -393,10 +393,26 @@ def push_rows_to_tracker(tracker_df):
 
     end_col = col_letter(len(sheet_headers))
     next_row = len(ws.get_all_values()) + 1
+    final_row = next_row + len(rows_to_append) - 1
+
+    # Expand the grid if the target range would exceed the sheet's current row_count.
+    # Sheets are created with a fixed grid (often 26472 rows); writes past that fail
+    # with "exceeds grid limits" until the grid is grown.
+    try:
+        current_rows = ws.row_count
+    except Exception:
+        current_rows = None
+
+    if current_rows is not None and final_row > current_rows:
+        rows_to_add = (final_row - current_rows) + 100  # small buffer for next push
+        try:
+            ws.add_rows(rows_to_add)
+        except Exception as e:
+            return 0, f"Could not expand sheet grid: {type(e).__name__}: {str(e)[:200]}"
 
     try:
         ws.update(
-            f"A{next_row}:{end_col}{next_row + len(rows_to_append) - 1}",
+            f"A{next_row}:{end_col}{final_row}",
             rows_to_append,
             value_input_option="USER_ENTERED",
         )
