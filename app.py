@@ -23,6 +23,18 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ─── Capture Sheets-OAuth callback params BEFORE st.login() can see them ───
+# When the user returns from the Sheets consent screen the URL has ?code=... and
+# ?state=... — exactly the shape of a Streamlit st.login() callback. If we let
+# those params survive until st.login() runs they may confuse its auth state and
+# blow away the whole session (forcing re-login + losing tracker_df). So we
+# stash them in session_state and immediately clear the URL.
+_pending_code = st.query_params.get("code")
+if _pending_code and not st.session_state.get("gsheet_credentials"):
+    st.session_state["_pending_oauth_code"] = _pending_code
+    st.session_state["_pending_oauth_state"] = st.query_params.get("state")
+    st.query_params.clear()
+
 # ─── Paths ───
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -225,27 +237,42 @@ def _get_oauth_flow(code_verifier: str | None = None):
 
 
 def handle_oauth_callback():
-    """If we returned from Google OAuth with ?code=..., exchange for a token
-    and store it in session_state. Called once per page load."""
-    if st.session_state.get("gsheet_credentials"):
-        return  # already have token
+    """Complete the Sheets OAuth token exchange.
 
-    code = st.query_params.get("code")
+    Reads the ?code=/state= params stashed in session_state at the very top
+    of the script (before st.login() could see them), looks up the matching
+    PKCE code_verifier from session_state, and exchanges for an access token.
+    """
+    if st.session_state.get("gsheet_credentials"):
+        return  # already authorized
+
+    code = st.session_state.get("_pending_oauth_code")
     if not code:
         return
 
-    # Restore PKCE verifier saved in get_oauth_url() — needed because each
-    # Streamlit rerun creates a fresh Flow instance.
     code_verifier = st.session_state.get("oauth_code_verifier")
+    state_in_callback = st.session_state.get("_pending_oauth_state")
+    state_in_session = st.session_state.get("oauth_state")
+
+    # Pop the one-shot pending params no matter what — don't keep retrying.
+    st.session_state.pop("_pending_oauth_code", None)
+    st.session_state.pop("_pending_oauth_state", None)
+
     if not code_verifier:
-        # Stale ?code= without a matching verifier (e.g. browser back/forward
-        # or a callback for the st.login() flow). Clear the param and bail
-        # silently — the user can click Authorize again.
-        st.query_params.clear()
+        st.error(
+            "Sheets authorization could not be completed: the session lost the "
+            "PKCE verifier between the redirect and the return. Click "
+            "**Authorize Sheets Access** again to retry."
+        )
+        return
+
+    if state_in_session and state_in_callback and state_in_session != state_in_callback:
+        st.error("Sheets OAuth state mismatch — possible CSRF, refusing to continue.")
         return
 
     flow = _get_oauth_flow(code_verifier=code_verifier)
     if not flow:
+        st.error("Sheets OAuth client not configured (missing secrets).")
         return
 
     try:
@@ -259,11 +286,9 @@ def handle_oauth_callback():
             "client_secret": creds.client_secret,
             "scopes": creds.scopes,
         }
-        # Clear one-shot OAuth state so we don't reuse it
         st.session_state.pop("oauth_code_verifier", None)
         st.session_state.pop("oauth_state", None)
-        # Clear ?code= from URL to avoid re-running on refresh
-        st.query_params.clear()
+        st.success("✅ Sheets access authorized — you can now push to BC Tracker.")
     except Exception as e:
         st.error(f"OAuth callback failed: {e}")
 
@@ -281,7 +306,7 @@ def get_oauth_url():
     auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",
+        prompt="select_account",
     )
     st.session_state["oauth_code_verifier"] = flow.code_verifier
     st.session_state["oauth_state"] = state
