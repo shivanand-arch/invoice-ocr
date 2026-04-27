@@ -3,6 +3,11 @@ import anthropic
 import base64
 import json
 import os
+# Relax oauthlib's strict scope-equality check on token responses. Google
+# silently adds userinfo.profile alongside openid even if you didn't request
+# it, which would otherwise cause Flow.fetch_token() to throw
+# "Scope has changed from … to …". Must be set before importing oauthlib.
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
