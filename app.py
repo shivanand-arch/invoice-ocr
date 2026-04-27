@@ -202,12 +202,14 @@ GSHEET_OAUTH_SCOPES = [
 ]
 
 
-def _get_oauth_flow(code_verifier: str | None = None):
+def _get_oauth_flow():
     """Build the google-auth-oauthlib Flow object from secrets.
 
-    If `code_verifier` is provided (callback path), reuse it so PKCE
-    completes correctly. Otherwise the flow will autogenerate one when
-    `authorization_url()` is called.
+    PKCE is intentionally NOT used: this is a confidential client (a web app
+    with a client_secret), so PKCE is optional, and persisting a code_verifier
+    across the consent-screen roundtrip is unreliable on Streamlit Cloud
+    (session_state can be reset between the redirect-out and redirect-back).
+    Confidentiality is provided by the client_secret in the token exchange.
     """
     client_id = st.secrets.get("GSHEET_OAUTH_CLIENT_ID", "")
     client_secret = st.secrets.get("GSHEET_OAUTH_CLIENT_SECRET", "")
@@ -227,21 +229,19 @@ def _get_oauth_flow(code_verifier: str | None = None):
     }
     flow = Flow.from_client_config(client_config, scopes=GSHEET_OAUTH_SCOPES)
     flow.redirect_uri = redirect_uri
-    # PKCE: either reuse the verifier persisted from get_oauth_url(), or let
-    # the flow autogenerate a fresh one on authorization_url().
-    if code_verifier:
-        flow.code_verifier = code_verifier
-    else:
-        flow.autogenerate_code_verifier = True
+    # Explicitly disable PKCE — see docstring above.
+    flow.code_verifier = None
+    flow.autogenerate_code_verifier = False
     return flow
 
 
 def handle_oauth_callback():
     """Complete the Sheets OAuth token exchange.
 
-    Reads the ?code=/state= params stashed in session_state at the very top
-    of the script (before st.login() could see them), looks up the matching
-    PKCE code_verifier from session_state, and exchanges for an access token.
+    Reads the ?code= param stashed in session_state at the very top of the
+    script (before st.login() could see it) and exchanges it for an access
+    token. PKCE is disabled — the client_secret is the proof of identity, so
+    no verifier needs to be persisted across the consent-screen roundtrip.
     """
     if st.session_state.get("gsheet_credentials"):
         return  # already authorized
@@ -250,27 +250,11 @@ def handle_oauth_callback():
     if not code:
         return
 
-    code_verifier = st.session_state.get("oauth_code_verifier")
-    state_in_callback = st.session_state.get("_pending_oauth_state")
-    state_in_session = st.session_state.get("oauth_state")
-
-    # Pop the one-shot pending params no matter what — don't keep retrying.
+    # Pop the one-shot pending params so a failed attempt doesn't keep retrying.
     st.session_state.pop("_pending_oauth_code", None)
     st.session_state.pop("_pending_oauth_state", None)
 
-    if not code_verifier:
-        st.error(
-            "Sheets authorization could not be completed: the session lost the "
-            "PKCE verifier between the redirect and the return. Click "
-            "**Authorize Sheets Access** again to retry."
-        )
-        return
-
-    if state_in_session and state_in_callback and state_in_session != state_in_callback:
-        st.error("Sheets OAuth state mismatch — possible CSRF, refusing to continue.")
-        return
-
-    flow = _get_oauth_flow(code_verifier=code_verifier)
+    flow = _get_oauth_flow()
     if not flow:
         st.error("Sheets OAuth client not configured (missing secrets).")
         return
@@ -286,30 +270,21 @@ def handle_oauth_callback():
             "client_secret": creds.client_secret,
             "scopes": creds.scopes,
         }
-        st.session_state.pop("oauth_code_verifier", None)
-        st.session_state.pop("oauth_state", None)
         st.success("✅ Sheets access authorized — you can now push to BC Tracker.")
     except Exception as e:
         st.error(f"OAuth callback failed: {e}")
 
 
 def get_oauth_url():
-    """Build the Google OAuth consent URL the user should be sent to.
-
-    Persists the PKCE code_verifier and state in session_state so the
-    callback (which runs in a fresh Streamlit rerun with a fresh Flow
-    instance) can complete the token exchange.
-    """
+    """Build the Google OAuth consent URL the user should be sent to."""
     flow = _get_oauth_flow()
     if not flow:
         return None
-    auth_url, state = flow.authorization_url(
+    auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="select_account",
     )
-    st.session_state["oauth_code_verifier"] = flow.code_verifier
-    st.session_state["oauth_state"] = state
     return auth_url
 
 
