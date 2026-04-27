@@ -190,8 +190,13 @@ GSHEET_OAUTH_SCOPES = [
 ]
 
 
-def _get_oauth_flow():
-    """Build the google-auth-oauthlib Flow object from secrets."""
+def _get_oauth_flow(code_verifier: str | None = None):
+    """Build the google-auth-oauthlib Flow object from secrets.
+
+    If `code_verifier` is provided (callback path), reuse it so PKCE
+    completes correctly. Otherwise the flow will autogenerate one when
+    `authorization_url()` is called.
+    """
     client_id = st.secrets.get("GSHEET_OAUTH_CLIENT_ID", "")
     client_secret = st.secrets.get("GSHEET_OAUTH_CLIENT_SECRET", "")
     redirect_uri = st.secrets.get("GSHEET_OAUTH_REDIRECT_URI", "http://localhost:8501/")
@@ -210,6 +215,12 @@ def _get_oauth_flow():
     }
     flow = Flow.from_client_config(client_config, scopes=GSHEET_OAUTH_SCOPES)
     flow.redirect_uri = redirect_uri
+    # PKCE: either reuse the verifier persisted from get_oauth_url(), or let
+    # the flow autogenerate a fresh one on authorization_url().
+    if code_verifier:
+        flow.code_verifier = code_verifier
+    else:
+        flow.autogenerate_code_verifier = True
     return flow
 
 
@@ -223,7 +234,17 @@ def handle_oauth_callback():
     if not code:
         return
 
-    flow = _get_oauth_flow()
+    # Restore PKCE verifier saved in get_oauth_url() — needed because each
+    # Streamlit rerun creates a fresh Flow instance.
+    code_verifier = st.session_state.get("oauth_code_verifier")
+    if not code_verifier:
+        # Stale ?code= without a matching verifier (e.g. browser back/forward
+        # or a callback for the st.login() flow). Clear the param and bail
+        # silently — the user can click Authorize again.
+        st.query_params.clear()
+        return
+
+    flow = _get_oauth_flow(code_verifier=code_verifier)
     if not flow:
         return
 
@@ -238,6 +259,9 @@ def handle_oauth_callback():
             "client_secret": creds.client_secret,
             "scopes": creds.scopes,
         }
+        # Clear one-shot OAuth state so we don't reuse it
+        st.session_state.pop("oauth_code_verifier", None)
+        st.session_state.pop("oauth_state", None)
         # Clear ?code= from URL to avoid re-running on refresh
         st.query_params.clear()
     except Exception as e:
@@ -245,15 +269,22 @@ def handle_oauth_callback():
 
 
 def get_oauth_url():
-    """Build the Google OAuth consent URL the user should be sent to."""
+    """Build the Google OAuth consent URL the user should be sent to.
+
+    Persists the PKCE code_verifier and state in session_state so the
+    callback (which runs in a fresh Streamlit rerun with a fresh Flow
+    instance) can complete the token exchange.
+    """
     flow = _get_oauth_flow()
     if not flow:
         return None
-    auth_url, _ = flow.authorization_url(
+    auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
     )
+    st.session_state["oauth_code_verifier"] = flow.code_verifier
+    st.session_state["oauth_state"] = state
     return auth_url
 
 
