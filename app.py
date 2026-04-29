@@ -100,22 +100,30 @@ st.markdown("""
 # ─── Google OAuth (exotel.com only) ───
 ALLOWED_DOMAIN = "exotel.com"
 
-_user = st.user if hasattr(st, "user") else getattr(st, "experimental_user", None)
-_is_logged_in = getattr(_user, "is_logged_in", False) if _user else False
-user_email = (getattr(_user, "email", None) or "") if _user else ""
+# BYPASS_LOGIN escape hatch — set in local secrets when developing offline.
+# On Streamlit Cloud (where st.login() works) leave this unset/absent.
+_bypass_login = str(st.secrets.get("BYPASS_LOGIN", "")).strip().lower() in ("1", "true", "yes")
 
-if not _is_logged_in:
-    st.markdown("### Please sign in with your Exotel Google account")
-    st.login()
-    st.stop()
+if _bypass_login:
+    user_email = st.secrets.get("BYPASS_LOGIN_EMAIL", f"local-dev@{ALLOWED_DOMAIN}")
+    _is_logged_in = True
+else:
+    _user = st.user if hasattr(st, "user") else getattr(st, "experimental_user", None)
+    _is_logged_in = getattr(_user, "is_logged_in", False) if _user else False
+    user_email = (getattr(_user, "email", None) or "") if _user else ""
 
-if not user_email.endswith(f"@{ALLOWED_DOMAIN}"):
-    st.error(f"Access restricted to @{ALLOWED_DOMAIN} accounts. You are signed in as {user_email}.")
-    st.logout()
-    st.stop()
+    if not _is_logged_in:
+        st.markdown("### Please sign in with your Exotel Google account")
+        st.login()
+        st.stop()
 
-st.caption(f"Signed in as **{user_email}**")
-if st.sidebar.button("Sign out"):
+    if not user_email.endswith(f"@{ALLOWED_DOMAIN}"):
+        st.error(f"Access restricted to @{ALLOWED_DOMAIN} accounts. You are signed in as {user_email}.")
+        st.logout()
+        st.stop()
+
+st.caption(f"Signed in as **{user_email}**" + (" _(bypass mode)_" if _bypass_login else ""))
+if not _bypass_login and st.sidebar.button("Sign out"):
     st.logout()
 
 # ─── Tracker Column Definitions ───
